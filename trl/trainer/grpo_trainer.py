@@ -830,16 +830,18 @@ class GRPOTrainer(Trainer):
 
     # Get the per-token log probabilities for the completions for the model and the reference model
     @profiling_decorator
-    def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep, batch_size=None) -> torch.Tensor:
-        batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
+    def _get_per_token_logps(self, model, inputs_embeds, input_ids, attention_mask, logits_to_keep, batch_size=None) -> torch.Tensor:
+        batch_size = batch_size or inputs_embeds.size(0)  # Chunk inputs into smaller batches to reduce memory peak
         all_logps = []
-        for i in range(0, input_ids.size(0), batch_size):
+        for i in range(0, inputs_embeds.size(0), batch_size):
             input_ids_batch = input_ids[i : i + batch_size]
+            inputs_embeds_batch = inputs_embeds[i : i + batch_size]
             attention_mask_batch = attention_mask[i : i + batch_size]
 
             # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
+            # We give the inputs_embeds to the model because of the latent steps
             logits = model(
-                input_ids=input_ids_batch, attention_mask=attention_mask_batch, logits_to_keep=logits_to_keep + 1
+                inputs_embeds=inputs_embeds_batch, attention_mask=attention_mask_batch, logits_to_keep=logits_to_keep + 1
             ).logits
             logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
             input_ids_batch = input_ids_batch[:, -logits_to_keep:]
@@ -997,6 +999,10 @@ class GRPOTrainer(Trainer):
 
         # Generate completions using either vLLM or regular generation
         if self.use_vllm:
+            # Raise error for now
+            raise ValueError(
+                "vLLM server mode is not supported for Latent Reasoner in GRPOTrainer yet."
+            )
             # First, update the vLLM weights if needed
             if self.state.global_step != self._last_loaded_step:
                 self._move_model_to_vllm()
@@ -1084,14 +1090,24 @@ class GRPOTrainer(Trainer):
                     if self.is_fsdp_enabled
                     else nullcontext()
                 ):
-                    prompt_completion_ids = unwrapped_model.generate(
+                    # prompt_completion_ids = unwrapped_model.generate(
+                    #     prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
+                    # )
+
+                    # Generate completions using the model
+                    # This custom generate method from Latent reasoner returns:
+                    # 1) the completion token IDs for latent steps + language steps, no prompt
+                    # 2) and the embeddings for the prompt + latent steps + language steps
+                    completion_ids, prompt_completion_embeds = unwrapped_model.generate(
                         prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
                     )
 
             # Compute prompt length and extract completion ids
             prompt_length = prompt_ids.size(1)
-            prompt_ids = prompt_completion_ids[:, :prompt_length]
-            completion_ids = prompt_completion_ids[:, prompt_length:]
+            # prompt_ids = prompt_completion_ids[:, :prompt_length]
+            # completion_ids = prompt_completion_ids[:, prompt_length:]
+            prompt_embeds = prompt_completion_embeds[:, :prompt_length]
+            completion_embeds = prompt_completion_embeds[:, prompt_length:]
 
         # Mask everything after the first EOS token
         is_eos = completion_ids == self.processing_class.eos_token_id
@@ -1099,6 +1115,21 @@ class GRPOTrainer(Trainer):
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
         sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
         completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+
+        # Create another mask for latent steps since they can not be used for log prob computation
+        # We only mask the latent steps at the beginning of the sequence, other ones are not masked
+        # and should be penalized by the format reward function if generated outside of the beginning of the sequence
+        is_start = completion_ids == self.processing_class.start_latent_token_id
+        is_end = completion_ids == self.processing_class.end_latent_token_id
+        start_seen = is_start.cumsum(dim=1)
+        end_seen   = is_end.cumsum(dim=1)
+        inside_block = (start_seen >= 1) & (end_seen == 0)
+        inside_block &= ~is_start
+        is_latent = ((completion_ids == self.processing_class.latent_token_id) & inside_block).long()
+
+        # ASSUMPTION: We assume all completions in the batch have the same number of latent steps
+        assert is_latent.sum(dim=1).unique().numel() == 1, "All completions in batch should have same number of latent steps"
+        num_latent_steps = is_latent.sum(dim=1).unique().item()
 
         # Convert tensor to a list of lists of token IDs. This will be passed to the reward function, avoiding the need
         # to re-tokenize completions if the reward is computed from tokens.
@@ -1114,7 +1145,13 @@ class GRPOTrainer(Trainer):
         # Concatenate prompt_mask with completion_mask for logit computation
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
 
-        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
+        # We only need to compute the logits for the completion tokens
+        # Not for the prompt and latent steps
+        # Since latent steps are not for decoding, we shouldn't compute the logits for them
+        #### ASSUMPTION: We assume all completions in the batch have the same number of latent steps    ####
+        #### and they are all at the beginning of the completion sequence                               ####
+        #### If this doesn't hold, change this implementation                                           ####
+        logits_to_keep = completion_ids.size(1) - num_latent_steps - 1 # -1 to ignore the start latent token
         batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
 
         with torch.no_grad():
@@ -1123,7 +1160,7 @@ class GRPOTrainer(Trainer):
             # per_token_logps.detach() instead.
             if self.num_iterations > 1 or self.args.steps_per_generation > self.args.gradient_accumulation_steps:
                 old_per_token_logps = self._get_per_token_logps(
-                    self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size
+                    self.model, prompt_completion_embeds, completion_ids, attention_mask, logits_to_keep, batch_size
                 )
             else:
                 old_per_token_logps = None
@@ -1247,8 +1284,10 @@ class GRPOTrainer(Trainer):
         return {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
+            "prompt_completion_embeds": prompt_completion_embeds,
             "completion_ids": completion_ids,
             "completion_mask": completion_mask,
+            "logits_to_keep": logits_to_keep,
             "advantages": advantages,
             "old_per_token_logps": old_per_token_logps,
         }
