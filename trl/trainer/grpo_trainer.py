@@ -1152,7 +1152,10 @@ class GRPOTrainer(Trainer):
         #### ASSUMPTION: We assume all completions in the batch have the same number of latent steps    ####
         #### and they are all at the beginning of the completion sequence                               ####
         #### If this doesn't hold, change this implementation                                           ####
-        logits_to_keep = completion_ids.size(1) - num_latent_steps - 1 # -1 to ignore the start latent token
+        if num_latent_steps == 0:
+            logits_to_keep = completion_ids.size(1)
+        else:
+            logits_to_keep = completion_ids.size(1) - num_latent_steps - 1 # -1 to ignore the start latent token
         # Also create a tensor version since returned values should be tensor
         logits_to_keep_tensor = torch.full((completion_ids.size(0), 1), logits_to_keep, dtype=torch.int, device=device)
         batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
