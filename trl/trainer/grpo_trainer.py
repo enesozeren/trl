@@ -385,6 +385,7 @@ class GRPOTrainer(Trainer):
         callbacks: Optional[list[TrainerCallback]] = None,
         optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
         peft_config: Optional["PeftConfig"] = None,
+        num_latent_steps: Optional[int] = None,
     ):
         # Args
         if args is None:
@@ -504,6 +505,7 @@ class GRPOTrainer(Trainer):
         self.loss_type = args.loss_type
         self.scale_rewards = args.scale_rewards
         self.mask_truncated_completions = args.mask_truncated_completions
+        self.num_latent_steps = num_latent_steps
 
         # Datasets
         self.shuffle_dataset = args.shuffle_dataset
@@ -1099,7 +1101,9 @@ class GRPOTrainer(Trainer):
                     # 1) the completion token IDs for latent steps + language steps, no prompt
                     # 2) and the embeddings for the prompt + latent steps + language steps
                     completion_ids, prompt_completion_embeds = unwrapped_model.generate(
-                        prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
+                        prompt_ids, attention_mask=prompt_mask, 
+                        num_latent_steps=self.num_latent_steps,
+                        generation_config=self.generation_config
                     )
                     prompt_completion_embeds = prompt_completion_embeds.detach()
 
@@ -1130,7 +1134,6 @@ class GRPOTrainer(Trainer):
 
         # ASSUMPTION: We assume all completions in the batch have the same number of latent steps
         assert is_latent.sum(dim=1).unique().numel() == 1, "All completions in batch should have same number of latent steps"
-        num_latent_steps = is_latent.sum(dim=1).unique().item()
 
         # Convert tensor to a list of lists of token IDs. This will be passed to the reward function, avoiding the need
         # to re-tokenize completions if the reward is computed from tokens.
@@ -1152,10 +1155,10 @@ class GRPOTrainer(Trainer):
         #### ASSUMPTION: We assume all completions in the batch have the same number of latent steps    ####
         #### and they are all at the beginning of the completion sequence                               ####
         #### If this doesn't hold, change this implementation                                           ####
-        if num_latent_steps == 0:
+        if self.num_latent_steps == 0:
             logits_to_keep = completion_ids.size(1)
         else:
-            logits_to_keep = completion_ids.size(1) - num_latent_steps - 1 # -1 to ignore the start latent token
+            logits_to_keep = completion_ids.size(1) - self.num_latent_steps - 1 # -1 to ignore the start latent token
         # Also create a tensor version since returned values should be tensor
         logits_to_keep_tensor = torch.full((completion_ids.size(0), 1), logits_to_keep, dtype=torch.int, device=device)
         batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
